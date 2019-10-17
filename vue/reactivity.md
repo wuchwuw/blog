@@ -84,8 +84,6 @@ ref是Vue3.x中引入的新概念，通过ref API同样可以创建一个响应�
 
 ### 源码
 
-    // todo
-
 #### reactive
 
     // packages/reactivity/reactive.ts
@@ -232,3 +230,302 @@ ref是Vue3.x中引入的新概念，通过ref API同样可以创建一个响应�
       }
       return result
     }
+
+响应式对象最重要的功能就是在访问它的时候能收集依赖，在更改它的值的时候能对所有收集到依赖进行派发更新。
+可以看到，在访问响应式对象的时候会触发Proxy的get方法，并调用track方法收集依赖。
+
+    export function track(
+      target: any,
+      type: OperationTypes,
+      key?: string | symbol
+    ) {
+      if (!shouldTrack) {
+        return
+      }
+      // 拿到栈中的最后一个effect，可以简单的理解为当前key的访问发生在哪个环境中
+      // 比如在执行计算属性传入的回调前，会将创建计算属性生成的effect添加到栈中
+      // 那么在执行回调的过程中，会对依赖的响应式对象进行访问，此时在这个地方拿到的
+      // 就是computed生成的effetc，所以当响应式对象更改时，会对computed进行更新
+      // 后面介绍computed会再详细介绍
+      const effect = activeReactiveEffectStack[activeReactiveEffectStack.length - 1]
+      if (!effect) {
+        return
+      }
+      if (type === OperationTypes.ITERATE) {
+        key = ITERATE_KEY
+      }
+      // 创建depsMap，并保存到全局的targetMap中,
+      // map的key对应响应式对象的key，
+      // map的value是一个set，用来保存对应key依赖的所有effect
+      // 这个set也就是Vue2.x中的Dep
+      let depsMap = targetMap.get(target)
+      if (depsMap === void 0) {
+        targetMap.set(target, (depsMap = new Map()))
+      }
+      let dep = depsMap.get(key!)
+      if (dep === void 0) {
+        depsMap.set(key!, (dep = new Set()))
+      }
+      // 判断set中是否已经存在当前effect
+      // 如果不存在，则添加进set中
+      // 并把set保存到effect的deps属性上
+      if (!dep.has(effect)) {
+        dep.add(effect)
+        effect.deps.push(dep)
+        if (__DEV__ && effect.onTrack) {
+          effect.onTrack({
+            effect,
+            target,
+            type,
+            key
+          })
+        }
+      }
+    }
+
+在更改响应式对象时，会触发Proxy的set方法，执行set的过程中调用trigger方法来派发更新。
+
+    export function trigger(
+      target: any,
+      type: OperationTypes,
+      key?: string | symbol,
+      extraInfo?: any
+    ) {
+      // 通过targetMap拿到当前响应式对象依赖的effect
+      const depsMap = targetMap.get(target)
+      if (depsMap === void 0) {
+        // never been tracked
+        return
+      }
+      const effects = new Set<ReactiveEffect>()
+      const computedRunners = new Set<ReactiveEffect>()
+
+      // 根据不同的操作，来决定哪些effect需要派发更新
+      // 通过addRunners方法区分computedEffect或者普通effect
+      // 并添加到创建好的set中
+      if (type === OperationTypes.CLEAR) {
+        // 如果是clear操作，则拿到所有的effect
+        depsMap.forEach(dep => {
+          addRunners(effects, computedRunners, dep)
+        })
+      } else {
+        // 如果key值存在，则拿到当前key的所有deps
+        if (key !== void 0) {
+          addRunners(effects, computedRunners, depsMap.get(key))
+        }
+        // 如果当前对象是可迭代的，那么在进行添加或者删除操作的时候，会改变可迭代对象
+        // 的长度，这时也应该对依赖数组的length属性，或者是可迭代对象的Symbol('iterate')属性
+        // 的effect进行更新
+        if (type === OperationTypes.ADD || type === OperationTypes.DELETE) {
+          const iterationKey = Array.isArray(target) ? 'length' : ITERATE_KEY
+          addRunners(effects, computedRunners, depsMap.get(iterationKey))
+        }
+      }
+      // 创建迭代方法，并执行所有已添加的effect
+      const run = (effect: ReactiveEffect) => {
+        scheduleRun(effect, target, type, key, extraInfo)
+      }
+      // Important: computed effects must be run first so that computed getters
+      // can be invalidated before any normal effects that depend on them are run.
+      computedRunners.forEach(run)
+      effects.forEach(run)
+    }
+
+    function scheduleRun(
+      effect: ReactiveEffect,
+      target: any,
+      type: OperationTypes,
+      key: string | symbol | undefined,
+      extraInfo: any
+    ) {
+      if (__DEV__ && effect.onTrigger) {
+        effect.onTrigger(
+          extend(
+            {
+              effect,
+              target,
+              key,
+              type
+            },
+            extraInfo
+          )
+        )
+      }
+      // 如果effect上的scheduler存在，
+      // 则执行scheduler方法，否则直接执行effect
+      if (effect.scheduler !== void 0) {
+        effect.scheduler(effect)
+      } else {
+        effect()
+      }
+    }
+
+在Vue3.x中，effect是整个响应式的核心，不管是computed、watch、或者模板的更新，都跟effect有关，接下来介绍的计算属性中，会涉及effect的创建过程，以及计算属性是如何在它的依赖值改变时进行更新。
+
+#### computed
+
+    export function computed<T>(
+      getterOrOptions: (() => T) | WritableComputedOptions<T>
+    ): any {
+      // 判断传入的参数是不是函数，如果是则直接赋值给getter，
+      // 否则把参数的get方法赋值给getter，setter同理
+      const isReadonly = isFunction(getterOrOptions)
+      const getter = isReadonly
+        ? (getterOrOptions as (() => T))
+        : (getterOrOptions as WritableComputedOptions<T>).get
+      const setter = isReadonly
+        ? __DEV__
+          ? () => {
+              console.warn('Write operation failed: computed value is readonly')
+            }
+          : NOOP
+        : (getterOrOptions as WritableComputedOptions<T>).set
+
+      // 通过dirty值来决定是否要更新value的值
+      let dirty = true
+      let value: T
+
+      // 创建effect对象，传入getter函数和options
+      const runner = effect(getter, {
+        lazy: true,
+        // mark effect as computed so that it gets priority during trigger
+        computed: true,
+        scheduler: () => {
+          dirty = true
+        }
+      })
+      // 返回ComputedRef类型的对象
+      return {
+        [refSymbol]: true,
+        // expose effect so computed can be stopped
+        effect: runner,
+        // 访问computed的值时，根据dirty来决定是否执行runner重新计算value
+        get value() {
+          if (dirty) {
+            value = runner()
+            dirty = false
+          }
+          // When computed effects are accessed in a parent effect, the parent
+          // should track all the dependencies the computed property has tracked.
+          // This should also apply for chained computed properties.
+          trackChildRun(runner)
+          return value
+        },
+        set value(newValue: T) {
+          setter(newValue)
+        }
+      }
+    }
+
+创建computed的过程也很简单，可以看出computed函数最后返回的是一个ComputedRef类型的对象，并且将值存储在value属性上，通过get、set方法来控制value属性的值。这样有一个好处就是computed的值并不需要在创建或者依赖更新的时候立马计算，而是可以等到需要访问computed的值的时候，再通过dirty来决定是不是重新计算computed的值，接下来继续分析runner的创建。
+
+    export function effect<T = any>(
+      fn: () => T,
+      options: ReactiveEffectOptions = EMPTY_OBJ
+    ): ReactiveEffect<T> {
+      if (isEffect(fn)) {
+        fn = fn.raw
+      }
+      // 通过之前传入的getter，以及options来创建effect
+      const effect = createReactiveEffect(fn, options)
+      if (!options.lazy) {
+        effect()
+      }
+      return effect
+    }
+
+    function createReactiveEffect<T = any>(
+      fn: () => T,
+      options: ReactiveEffectOptions
+    ): ReactiveEffect<T> {
+      // 创建effect，可以看到effect其实是一个函数，返回了run函数的执行结果
+      // 并且在effect上挂载了一些属性和方法
+      const effect = function reactiveEffect(...args: any[]): any {
+        return run(effect, fn, args)
+      } as ReactiveEffect
+      effect[effectSymbol] = true
+      effect.active = true
+      effect.raw = fn
+      effect.scheduler = options.scheduler
+      effect.onTrack = options.onTrack
+      effect.onTrigger = options.onTrigger
+      effect.onStop = options.onStop
+      effect.computed = options.computed
+      effect.deps = []
+      return effect
+    }
+
+分析完computed的创建过程，本文将通过以下的例子，来介绍计算属性更新的流程:
+
+    import { computed, reactive } from 'vue'
+
+    const state = reacvite({ count: 1 })
+    const computedState = computed(() => state.count * 2)
+
+    console.log(computedState.vaule)  // 1
+    state = 3                         // 2
+    console.log(computedState.vaule)  // 3
+
+在创建完计算属性computedState，我们在步骤1访问它的value值，此时会触发get方法
+
+    get value() {
+      if (dirty) {
+        value = runner()
+        dirty = false
+      }
+      ...
+    }
+
+因为dirty的初始值为true，所以会执行runner函数计算value的值，也就是执行effect函数，而在effect函数里，返回的是run函数的执行结果
+
+    const effect = function reactiveEffect(...args: any[]): any {
+      return run(effect, fn, args)
+    } as ReactiveEffect
+
+    function run(effect: ReactiveEffect, fn: Function, args: any[]): any {
+    if (!effect.active) {
+      return fn(...args)
+    }
+    if (!activeReactiveEffectStack.includes(effect)) {
+      cleanup(effect)
+      try {
+        // 在执行 () => state.count * 2 之前将当前effect
+        // push到activeReactiveEffectStack中
+        activeReactiveEffectStack.push(effect)
+        return fn(...args)
+      } finally {
+        activeReactiveEffectStack.pop()
+      }
+    }
+  }
+
+执行fn(...args)也就是传入的() => state.count * 2函数时，会访问state.count的值，此时会触发Proyx上的
+get方法，根据我们之前对track方法的分析:
+
+    // 这里拿到的就是计算属性的effect，并保存到key值为count的dep中，完成依赖收集
+    // 并且返回state.count * 2的计算结果
+    const effect = activeReactiveEffectStack[activeReactiveEffectStack.length - 1]
+
+步骤2中，我们通过修改state.count的值触发Proxy的set方法，并调用trigger方法来派发更新，在trigger中
+拿到key值为count的dep，并通过scheduleRun来执行dep上保存的effect函数，由于我们创建computedEffect的时候，传入的options上的存在scheduler，所以会执行effect上的scheduler方法，来更改dirty的值。
+
+    // 创建computed effect
+    const runner = effect(getter, {
+      lazy: true,
+      // mark effect as computed so that it gets priority during trigger
+      computed: true,
+      scheduler: () => {
+        dirty = true
+      }
+    })
+
+
+    // scheduleRun方法中执行
+    if (effect.scheduler !== void 0) {
+      effect.scheduler(effect)
+    } else {
+      effect()
+    }
+
+这里也可以印证我们之前提到的细节，就是更改computed的依赖值并不会马上重新计算，而是将dirty设置为true。
+等待computed被再次访问。
