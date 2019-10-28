@@ -3,3 +3,7 @@
 ### reactivity
 
 [reactivity之ref篇](./vue3.x/reactivity/ref.md)
+
+[reactivity之reactive篇](./vue3.x/reactivity/reactive.md)
+
+[reactivity之effect篇](./vue3.x/reactivity/effect.md)
